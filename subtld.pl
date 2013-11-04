@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/local/bin/perl
 
 use strict;
 
@@ -51,11 +51,15 @@ use Data::Dumper;
 use POSIX ":sys_wait_h";
 use File::Path qw(make_path);
 use File::Find;       # will use to replace system call to find
+use Net::IDN::Encode ':all';
+#use NetPacket::IP;
+#use NetPacket::TCP;
+#use NetPacket::UDP;
 #use DBM::Deep;
 
 $SIG{CHLD} = \&REAPER;
 
-our $VERSION = '$Id: subtld.pl 57 2013-10-15 01:41:55Z kwhite $';
+our $VERSION = '$Id: subtld.pl 94 2013-11-04 18:19:46Z kwhite $';
 
 #use PerlIO::gzip;
 #use threads;
@@ -97,10 +101,12 @@ my %LOC = (
 my (%ROOTMAP, %ROOTIP, %ROOTBYIP);
 my (%OVERRIDE10, %OVERRIDE13);
 
+my $DNS_OARCBASE = '/mnt/oarc-pool3/collisions';
 my $DSTBASE = $ENV{HOME}.'/jas/gtld';
 
 my $MAXPROC = 12;
 my $MAXPROC_TCPDUMP = 40;
+#my $MAXPROC_TCPDUMP = 1;
 my $MAXPROC_SORT = 15;
 
 # Data structures for global TLD/Interisle categorization
@@ -112,6 +118,13 @@ my %INXMP;
 # Data structures to handle children
 my %CHILDREN;
 my @STIFFS;
+
+# Globals to configure checks
+my $DO_HYPHEN_CHECKS = 0;
+my $DO_LDH_CHECKS = 0;
+my $DO_LEN_CHECKS = 0;
+my $DO_RANDOM_CHECKS = 0;
+my $DO_PUNYCODE_CHECKS = 1;
 
 ############################################################################### 
 
@@ -135,6 +148,7 @@ sub CopyAndSub {
     my ($src, $dst_loc, $gtld, $year) = @_;
     my $dst = $dst_loc."/".$gtld.".gz";
     my $dst_log = $dst_loc."/".$gtld."_log.gz";
+    my $dst_sld = $dst_loc."/".$gtld."_sld";
     my $dst_dbfilename = $dst_loc."/".$gtld.".db";
     my $dst_log_nocollapse = $dst_loc."/".$gtld."_lognocollapse.gz";
     my $dst_interisle_log = $dst_loc."/".$gtld."_interisle.gz";
@@ -178,6 +192,7 @@ sub CopyAndSub {
     # from the list.
 
     open(my $outlog, "| gzip -c > $dst_log") || die "ERROR: failed to open output file $dst_log: $!";
+    open(my $outlogsld, ">$dst_sld") || die "ERROR: failed to open output file $dst_sld: $!";
     open(my $outlog2, "| gzip -c > $dst_log_nocollapse") || die "ERROR: failed to open output file $dst_log_nocollapse: $!";
     foreach my $sld (sort(keys(%$droplist))) {
 	if ($droplist->{$sld}{valid})
@@ -190,6 +205,7 @@ sub CopyAndSub {
 
 	    print $outlog "OK"." ".$sld." ".
 		$droplist->{$sld}{valid}."\n";
+	    print $outlogsld $sld."\n";
 	}
 	foreach my $section (sort(keys(%{$droplist->{$sld}{scrubs}}))) {
 #	print $outlog $section."\n";
@@ -203,6 +219,7 @@ sub CopyAndSub {
     }
     close($outlog);
     close($outlog2);
+    close($outlogsld);
 
     open(my $outlog, "| gzip -c > $dst_interisle_log") || die "ERROR: failed to open output file $dst_interisle_log: $!";
     foreach my $i (sort(keys(%intsum))) {
@@ -218,22 +235,24 @@ sub ScrubAndInterisle
 {
     my ($src) = @_;
 
-    my $DOVALIDCHECKS = 0;
-    
+#    binmode STDOUT, ":encoding(utf8)";
+
     chomp($src);
     my $interisle = "INNONE";
     my $scrub = "OK";
     my @elem = split(/ /, $src);
-#2011-04-12 20:54:06.876091 gree blog a-root 119.63.192.232 198.41.0.4 blog.gree
+#($date, $time, $gtld, $sld, $filenum, $protocol, "$sip.$sport", "$dip.$dport", $root, $type, $namelen, $name);
+#OLD###2011-04-12 20:54:06.876091 gree blog a-root 119.63.192.232 198.41.0.4 blog.gree
     my $gtld = $elem[2];
-    my $root = $elem[4];
+    my $root = $elem[8];
     if ((!defined $root) || ($root eq "")) {
 	# This only happened due to an earlier bug in the raw stage.
 	# It shouldn't happen in future runs.
 #	print "no root: $_\n";
 	return(undef);
     }
-    my $qstr = $elem[7];
+    my $qstr = $elem[11];
+    my $qstrlen = $elem[10];
     my @labels = split(/\./, lc($qstr));
     my %labels;
     foreach my $l (@labels) { $labels{$l}++; }
@@ -280,60 +299,72 @@ sub ScrubAndInterisle
     # Various validity checks
 
     my $scrubbed;
-    
-    # If total string is too long
-    # We want to count total characters in name.
-    # $qstr can have extra ^ as escape characters.
-    # ^^ means a single ^.  Replace it with $ to get it out of the
-    # way.  Then remove all remaining ^ characters (since they're
-    # just excape characters).
-    my $qstrlen = $qstr;
-    $qstrlen =~ s/\^\^/\$/g;
-    $qstrlen =~ s/\^//g;
-    if (length($qstrlen) > 253) {
-	$scrub = "INVALID";
-	$scrubbed++;
-    }
 
-    if (!$scrubbed && defined $sld) {
-	if (length($sld) < 3) {
-#	    print "SHORTSLD: $qstr\n";
-	    $scrub = "SHORTSLD";
+    if ($DO_LEN_CHECKS) {
+	if ($qstrlen > 253) {
+	    $scrub = "INVALID";
 	    $scrubbed++;
+	}
+	if (!$scrubbed && defined $sld) {
+	    if (length($sld) < 3) {
+#		print "SHORTSLD: $qstr\n";
+		$scrub = "SHORTSLD";
+		$scrubbed++;
+	    }
 	}
     }
 
-    if ($DOVALIDCHECKS) {
-    if (!$scrubbed && defined $sld) {
-	# If sld has any invalid characters
-	if ($sld =~ /[^a-zA-Z0-9\-]/) {
-	    $scrub = "INVALID";
+    if (!$scrubbed && (substr($sld, 0, 4) eq 'xn--') && ($DO_PUNYCODE_CHECKS)) {
+	my $unic;
+	eval {
+	    $unic = domain_to_unicode($sld);
+	};
+	if ($@) {
+	    # There was an error
+	    $scrub = "INVALIDPUNYCODE";
+	    print "INVALIDPUNYCODE: $sld -> $@\n";
 	    $scrubbed++;
 	}
-	elsif ((substr($sld, 2, 1) eq "-") &&
-	       (substr($sld, 0, 2) ne "xn")) {
-#	    print "INVALIDDASH $qstr\n";
-	    $scrub = "INVALID";
-	    $scrubbed++;
-	}
-	elsif (index($sld, '_') != -1) {
-#	    print "INVALIDUNDERSCORE $qstr\n";
-	    $scrub = "INVALID";
-	    $scrubbed++;
+	else {
+	    print "VALIDPUNYCODE: $sld -> $unic\n";
 	}
     }
+
+    if ($DO_LDH_CHECKS) {
+	if (!$scrubbed && defined $sld) {
+	    # If sld has any invalid characters
+#	    elsif ($sld =~ /[^a-zA-Z0-9\-]/) {
+	    if ($sld =~ /[^a-zA-Z0-9\-]/) {
+		$scrub = "INVALID";
+		$scrubbed++;
+	    }
+	    elsif ((substr($sld, 2, 2) eq "--") &&
+		   (substr($sld, 0, 2) ne "xn")) {
+#		print "INVALIDDASH $qstr\n";
+		$scrub = "INVALID";
+		$scrubbed++;
+	    }
+	    # If sld starts or ends with a hyphen
+	    elsif ((substr($sld, 0, 1) eq "-") ||
+		   (substr($sld, -1, 1) eq "-")) {
+		$scrub = "INVALID";
+		$scrubbed++;
+	    }
+	}
+    }    
     
-    # Walk through the labels, look for any that start or end with a
-    # dash.
-    if (!$scrubbed) {
-      LABELWALK: foreach my $label (@labels) {
-	  if ((substr($label, 0, 1) eq "-") ||
-	      (substr($label, -1, 1) eq "-")) {
-	      
-	      $scrub = "INVALID";
-	      $scrubbed++;
-	      last LABELWALK;
-	  }
+    if ($DO_HYPHEN_CHECKS) {
+	# Walk through the labels, look for any that start or end with a
+	# hyphen.
+	if (!$scrubbed) {
+	  LABELWALK: foreach my $label (@labels) {
+	      if ((substr($label, 0, 1) eq "-") ||
+		  (substr($label, -1, 1) eq "-")) {
+		  
+		  $scrub = "INVALID";
+		  $scrubbed++;
+		  last LABELWALK;
+	      }
 #	  else {
 	      # Commented out, because this shouldn't be
 	      # possible.  The labels have to come from a DNS
@@ -352,35 +383,35 @@ sub ScrubAndInterisle
 #	      $scrubbed++;
 #	      last LABELWALK;
 #	  }
-      }
-    }
-    }
-
-    if ($DOVALIDCHECKS) {
-    # Look for 10/13 character random
-    if (!$scrubbed) {
-	if ((length($flabel) == 10) && (!$OVERRIDE10{$flabel})) {
-	    # If it only consists of a-z, we consider it "random" 
-	    if ($flabel =~ /^[a-zA-Z]*$/) {
-		$scrub = "RANDOM10";
-		$scrubbed++;
-	    }
-	}
-	elsif ((length($flabel) == 13) && (substr($flabel, 0, 4) ne "xn--") && (!$OVERRIDE13{$flabel})) {
-	    # If it starts with a-z and contains a digit, we consider it "random"
-	    # can contain dashes.  Mostly only see up to 2, but this regexp 
-	    # allows any number.  Also, if it starts with "xn--", is isn't random.
-	    # That check was needed when dashes were added.
-	    if ($flabel =~ /^[a-z][a-z0-9\-]*[0-9][a-z0-9\-]*$/) {
-		$scrub = "RANDOM13";
-		$scrubbed++;
-	    }
+	  }
 	}
     }
+    
+    if ($DO_RANDOM_CHECKS) {
+	# Look for 10/13 character random
+	if (!$scrubbed) {
+	    if ((length($flabel) == 10) && (!$OVERRIDE10{$flabel})) {
+		# If it only consists of a-z, we consider it "random" 
+		if ($flabel =~ /^[a-zA-Z]*$/) {
+		    $scrub = "RANDOM10";
+		    $scrubbed++;
+		}
+	    }
+#	    elsif ((length($flabel) == 13) && (substr($flabel, 0, 4) ne "xn--") && (!$OVERRIDE13{$flabel})) {
+#		# If it starts with a-z and contains a digit, we consider it "random"
+#		# can contain dashes.  Mostly only see up to 2, but this regexp 
+#		# allows any number.  Also, if it starts with "xn--", is isn't random.
+#		# That check was needed when dashes were added.
+#		if ($flabel =~ /^[a-z][a-z0-9\-]*[0-9][a-z0-9\-]*$/) {
+#		    $scrub = "RANDOM13";
+#		    $scrubbed++;
+#		}
+#	    }
+	}
     }
-    $elem[7] = $scrub;
-    $elem[8] = $interisle;
-    $elem[9] = $qstr;
+    $elem[11] = $scrub;
+    $elem[12] = $interisle;
+    $elem[13] = $qstr;
     my $retrow = join(" ", @elem);
 
     return($scrub, $interisle, $retrow, $qstr, $sld);
@@ -410,7 +441,7 @@ sub addToDrop {
 
 sub VerifySrc {
     my (@src) = @_;
-    
+
     # A source should exist and be a directory
 
     my $badcount;
@@ -421,7 +452,7 @@ sub VerifySrc {
 	    $badcount++;
 	}
     }
-    if ($badcount) { exit(2); }
+    return ($badcount);
 }
 
 ############################################################################### 
@@ -463,15 +494,18 @@ sub VerifyDst {
 ############################################################################### 
 
 sub CalcSrcDst {
-    my ($year, $suffix) = @_;
+    my ($year, $suffix, $jassuffix, $systemwide_archive) = @_;
 
     my ($raw, $intermediate, $bytld, $jas);
 
     $raw = $LOC{$year}{raw};
 
-    $intermediate = $DSTBASE."/intermediate/".$LOC{$year}{date}."-".$suffix;
-    $bytld = $DSTBASE."/by-tld/".$LOC{$year}{date}."-".$suffix;
+    my $mydstbase = ($systemwide_archive) ? $DNS_OARCBASE : $DSTBASE;
+
+    $intermediate = $mydstbase."/intermediate/".$LOC{$year}{date}."-".$suffix;
+    $bytld = $mydstbase."/by-tld/".$LOC{$year}{date}."-".$suffix;
     $jas = $DSTBASE."/jas/".$LOC{$year}{date}."-".$suffix;
+    $jas .= "-".$jassuffix if defined $jassuffix;
 
     return($raw, $intermediate, $bytld, $jas)
 }
@@ -511,11 +545,29 @@ sub FindRawFiles {
 
 ############################################################################### 
 
+sub DumpRawMap {
+    my ($rawFiles, @dsts) = @_;
+
+    foreach my $dst (@dsts) {
+	my $ofile = $dst."/pcapmap";
+	open(OUT, ">$ofile") || die "ERROR failed to open output file $ofile: $!";
+
+	my $i = 0;
+	foreach my $file (@$rawFiles) {
+	    print OUT $i++." ".$file->{src}."\n";
+	}
+	close(OUT);
+    }
+}
+
+############################################################################### 
+
 sub ParseRawFiles {
     my ($rawFiles, $dst, $bytld_dst) = @_;
 
     my $sleeptime = 0;
     my $qlen = scalar(@$rawFiles);
+    my $i = 0;
     
     while ($qlen > 0) {
 	while (scalar(keys(%CHILDREN)) >= $MAXPROC_TCPDUMP) { 
@@ -539,12 +591,13 @@ sub ParseRawFiles {
 	    my $fulldest = $dst."/".$file->{root};
 	    make_path($fulldest);
 	    make_path($bytld_dst);
-	    DumpPcap($file->{src}, $fulldest."/".$file->{dst}, $bytld_dst);
+	    DumpPcap($file->{src}, $fulldest."/".$file->{dst}, $bytld_dst, $i);
 #	    print "ChildEnd: $file\n";
 	    exit(0);
 	}
 	
 	$qlen = scalar(@$rawFiles);
+	$i++;
     }
     while (scalar(keys(%CHILDREN)) > 0) { 
 	while (@STIFFS) {
@@ -557,22 +610,288 @@ sub ParseRawFiles {
 
 ###############################################################################
 
-sub DumpPcap {
-    my ($src, $dst, $bytld_dst) = @_;
+sub findOffset {
+    my ($data, $linktype) = @_;
 
-    print "DumpPcap: $src $dst $bytld_dst\n";
-#    return(1);
+    my $debugout = 0;
+
+    # Start with a packet from tcpdump, starting with the Ethernet
+    # Frame past the Premable.  (Not sure why I didn't get the
+    # preamble when I did -XX, but I didn't.)  Look for the EtherType
+    # of 8100 to detemine if we need to jump over the VLAN tag.  Then,
+    # decipher IPv4 or IPv6, then TCP or UDP, to get to the DNS
+    # packet, then find the start of the name.
+    
+    my $protocol;
+    my $offset = 12;
+    my $skipip;
+    my ($ip_verlen, $ip_ver);
+
+    if ($linktype == 1) {
+	my $ethertype = ($data->[$offset] * 256) + $data->[$offset + 1];
+	if (($ethertype == 0x8100) || ($ethertype == 0x0800) ||
+	    ($ethertype == 0x86dd)) {
+	    $offset += 2;
+	    $offset += 4 if ($ethertype == 0x8100);
+	}
+	else {
+	    printf("ethertype %04x unknown\n", $ethertype) if $debugout;
+	    return(-1);
+	}
+    }
+    elsif ($linktype == 101) {
+	print "linktype $linktype nolink " if $debugout;
+	$offset = 0;
+	$ip_verlen = $data->[$offset];
+	$ip_ver = ($ip_verlen & (128 + 64 + 32 + 16)) >> 4;
+	if (($ip_ver == 4) || ($ip_ver == 6)) {
+	    $skipip++;
+	    print "$offset: $ip_verlen ip_ver: $ip_ver " if $debugout;
+	}
+	else {
+	    return(-1);
+	}
+    }
+    elsif ($linktype == 108) {
+	print "linktype $linktype OpenBSD skip 4 " if $debugout;
+	$offset = 4;
+	$ip_verlen = $data->[$offset];
+	$ip_ver = ($ip_verlen & (128 + 64 + 32 + 16)) >> 4;
+	if (($ip_ver == 4) || ($ip_ver == 6)) {
+	    $skipip++;
+	    print "$offset: $ip_verlen ip_ver: $ip_ver " if $debugout;
+	}
+	else {
+	    return(-1);
+	}
+    }
+    else {
+	print "linktype $linktype UNKNOWN nolink " if $debugout;
+	$offset = 0;
+	$ip_verlen = $data->[$offset];
+	$ip_ver = ($ip_verlen & (128 + 64 + 32 + 16)) >> 4;
+	if (($ip_ver == 4) || ($ip_ver == 6)) {
+	    $skipip++;
+	    print "$offset: $ip_verlen ip_ver: $ip_ver " if $debugout;
+	}
+	else {
+	    return(-1);
+	}
+    }
+
+    if (!$skipip) {
+	$ip_verlen = $data->[$offset];
+	$ip_ver = ($ip_verlen & (128 + 64 + 32 + 16)) >> 4;
+	print "$offset: $ip_verlen ip_ver: $ip_ver " if $debugout;
+    }
+    if ($ip_ver == 6) {
+	my $next_header = $data->[$offset + 6];
+	print "next_header: $next_header " if $debugout;
+	$offset += 40;
+	while (!(($next_header == 6) || ($next_header == 17))) {
+	    $next_header = $data->[$offset + 0];
+	    $offset += 8 + (8 * $data->[$offset + 1]);
+	    last if $offset > 9000;
+	}
+	if ($next_header == 6) { $protocol = "tcp";}
+	elsif ($next_header == 17) { $protocol = "udp"; }
+	print "$offset " if $debugout;
+    }
+    elsif ($ip_ver == 4) {
+	my $ip_len = ($ip_verlen & (8 + 4 + 2 + 1));
+	print "$ip_verlen -> $ip_len " if $debugout;
+	my $prnum = $data->[$offset + 9];
+	$offset += (4 * $ip_len);
+	if ($prnum == 6) { $protocol = "tcp";}
+	elsif ($prnum == 17) { $protocol = "udp"; }
+	print "$offset " if $debugout;
+    }
+
+    if ($protocol eq "tcp") {
+	my $len = $data->[$offset + 12];
+	$len = ($len % (128 + 64 + 32 + 16)) >> 4;
+	$offset += ($len * 4);
+    }
+    elsif ($protocol eq "udp") {
+	$offset += 8;
+    }
+    
+    # DNS
+    $offset += 12;
+    $offset += 2 if ($protocol eq "tcp");  # two extra bytes, length
+
+    print "$offset " if $debugout;
+    if ($offset > 9000) {
+	$offset = -1;
+	print " -> $offset" if $debugout;
+    }
+    print "\n" if $debugout;
+
+    return($offset);
+}
+
+###############################################################################
+
+sub getNameFromData {
+    my ($data, $linktype) = @_;
+    
+    # In the case that the tcpdump output has control characters (^
+    # and M-) that can't be reversed, go to the actual tcpdump output
+    # to resurrect the name
+
+    my ($name, $namelen);
+
+    my $offset = findOffset($data, $linktype);
+    if ($offset < 0) {
+	print "ERROR: no offset\n";
+	return(undef, -1);
+    }
+
+    my ($sld, $tld);
+    my $i = $offset;
+    my $labelcount = 0;
+    my $labellen = $data->[$i];
+    while ((defined $labellen) && ($labellen > 0)) {
+	$labelcount++;
+	my $label;
+	if ($labelcount > 127) {
+	    print "ERROR: too many labels\n";
+	    return(undef, -2);
+	}
+	my $flags = $labellen & (128 + 64);
+	$labellen = $labellen & (32 + 16 + 8 + 4 + 2 + 1);
+	if ($flags > 0) {
+	    print "ERROR: label length ".$data->[$i]." has flags set.\n";
+	    return(undef, -3);
+	}
+	foreach (my $count = 0; $count < $labellen; $count++) {
+	    # before now, $i is pointing at the labellen.  move past.
+	    $i++;
+	    my $char = $data->[$i];
+	    $namelen++;
+	    # char 32 is the space, so space and below
+	    # 46 is .
+	    # 92 is \
+	    # 127 is DEL, above is undefined in ASCII
+	    if (($char < 33) || ($char == 46) || ($char == 92) ||
+		($char > 126)) {
+		$name .= '\\'.sprintf("%02x", $char);
+		$label .= '\\'.sprintf("%02x", $char);
+	    }
+	    else {
+		$name .= pack("C", $char);
+		$label .= pack("C", $char);
+	    }
+	}
+	$sld = $tld;
+	$tld = $label;
+	$i++;
+	$labellen = $data->[$i];
+	# $labellen is now holding the length of the _next_ label.
+	# Cheat here and check to see if that's 0.  If it isn't, add
+	# the "." label separator to our name.
+	if ($labellen != 0) {
+	    $name .= ".";
+	    $namelen++;
+	}
+    }
+    if (!defined $labellen) {
+	# We broke out of the loop becaose we walked past the end of
+	# the byte array, which means something wasn't right.
+	print "ERROR: got to end of data.\n";
+	return(undef, -4);
+    }
+    
+    return($name, $namelen, $sld);
+}
+
+###############################################################################
+
+sub DumpPcap {
+    my ($src, $dst, $bytld_dst, $filenum) = @_;
 
     open(my $outlog, "| gzip -c > $dst") || die "ERROR failed to open output file $dst: $!";
-    open(IN, "gunzip -dc \"$src\" | tcpdump -tttt -n -s 0 -r - 2> /dev/null |") || die "ERROR failed to open input file and tcpdump $src: $!";
+#    print "gunzip -dc \"$src\" | tcpdump -tttt -X -n -s 0 -r -\n";
+    
+    open(IN, "gunzip -c $src|" ); 
+    my $hdr;
+    sysread(IN, $hdr, 24); 
+    my ($magic, $maj, $min, $off, $acc, $snaplen, $linktype) = unpack("LSSLLLL", $hdr); 
+#    print "linktype: $linktype\n";
+    close(IN);
+
+    open(IN, "gunzip -dc \"$src\" | tcpdump -tttt -XX -n -s 0 -r - 2> /dev/null |") || die "ERROR failed to open input file and tcpdump $src: $!";
     my %files;
 
 #    gunzip -dc "$infile" | tcpdump -n -s 0 -r - 2> /dev/null | ./filter-tcpdump-tldlist.pl $tldlist | gzip -6 > $outname.gz
 #14:19:59.081577 IP6 2a02:2098:8711:8c21:0:2:b19:b00b.24372 > 2001:503:ba3e::2:30.53: 23630 [1au] A? www.hybridtraffic.com.home. (55)
 #2013-05-29 14:19:59.081577 IP6 2a02:2098:8711:8c21:0:2:b19:b00b.24372 > 2001:503:ba3e::2:30.53: 23630 [1au] A? www.hybridtraffic.com.home. (55)
+#2013-10-17 15:33:28.813057 IP 192.168.10.40.43000 > 192.168.10.250.53: Flags [P.], seq 0:45, ack 1, win 229, options [nop,nop,TS val 174806473 ecr 3132314737], length 4557684+ [1au] A? mail.kevbo.org. (43)
+    my $parseRawName = 0;
+    my @rawline;
+    my @rawdata;
 
     while (<IN>) {
 #	print "$_";
+	
+	if (substr($_, 0, 3) eq "\t0x") {
+	    # Line is raw data
+	    # Snarf it up, don't do anything else with it.
+	    if ($parseRawName) {
+#		print $_;
+#	0x0000:  4500 003c 3532 4000 4006 6f17 c0a8 0a28  E..<52@.@.o....(
+		# First byte is at pos 10.
+		my $pos = 10;
+		for (my $i = 0; $i < 16; $i++) {
+		    my $chrs = substr($_, $pos, 2);
+#		    print "$chrs\n";
+		    push(@rawdata, hex($chrs));
+		    $pos += 2;
+		    if (($i % 2) == 1) { $pos ++; }
+		}
+	    }
+	    next;
+	}
+
+	if ($parseRawName) {
+	    # We _were_ in $parseRawName.  This line isn't raw data.
+	    # Thus, we are done, and should finish our row and print
+	    # it out.  Oh, and then process the current line.
+
+	    my $origname = pop(@rawline);
+	    my $tld = pop(@rawline);
+	    my $protocol = $rawline[5];
+	    my $dip = $rawline[7];
+	    my $ipv = 4;
+	    if (index($dip, ':') != -1) {
+		# if the destination IP had a :, it is ipv6
+		$ipv = 6;
+	    }
+	    my ($name, $namelen, $sld) = getNameFromData(\@rawdata, $linktype);
+	    if ($namelen < 0) {
+		print "RAWSKIP: INVALIDRAWNAME: $filenum: ".$rawline[4]." ".$origname." ".$rawline[6]." ".$rawline[7]."\n";
+	    }
+	    else {
+		push (@rawline, $namelen, lc($name));
+		$rawline[3] = lc($sld);
+		
+		print $outlog (join " ", @rawline)."\n";
+#		print "Finished raw: ".(join " ", @rawline)."\n";
+		my $file = $tld;
+		if (!defined $files{$file}) {
+		    #$files{$file} = new IO::Compress::Gzip "$outdir/$file" || die "gzip failed: $GzipError";
+		    open(my $fh, ">>", "$bytld_dst/$file") || die "ERROR: failed to open for $tld: $!";
+		    $files{$file} = $fh;
+		}
+		my $fh = $files{$file};
+		syswrite $fh, (join " ", @rawline)."\n";
+	    }
+	    
+	    $parseRawName = 0;
+	}
+	
+	my $rawskip;
+	my $protocol = 'udp';
 	# The query is at the end.  It ends with the final ".".  It
 	# starts past the ? in the query type.  If you can't find a ?
 	# followed by a space, then this isn't a valid query row.
@@ -580,7 +899,10 @@ sub DumpPcap {
 	# actually a valid part of a domain name
 	my $nameend = rindex($_, ".");
 	my $namestart = index($_, "? ");
-	next unless $namestart > -1;
+	if ($namestart == -1)
+	{
+	    $rawskip++;
+	}
 	my $name = substr($_, $namestart+2, $nameend-$namestart-2);
 	$name = lc($name);
 
@@ -590,53 +912,104 @@ sub DumpPcap {
         next unless defined $NEWGTLD{$tld};
 #	print "i care: :$tld:\n";
 
-	# Replace all spaces with ^$ 
-	# TCPDUMP uses various ^x for non-printable characters, and ^^
-	# for the ^ itself.  It doesn't seem to output ^$ for
-	# anything.
-	# Note: TCPDUMP's output for characters > 127 is actually bad,
-	# and darn near un-parseable.  Every octet has an M- in
-	# front of it, which is indistinguishable from a REAL string
-	# of "M-".  Which means I can't just go through and remove all
-	# "M-" for count purposes.  So, basically, any name that comes
-	# through with characters > 128 will have their length counted
-	# wrong, and could get thrown out for being "too long", even
-	# if they weren't.
-	$name =~ y/ /^$/;
+	my $namelen = length($name);
+	# Replace all \ with \5c
+	# Replace all spaces with \20
+	# If any ^ or m- are found, will go into binary mode and do
+	# the whole string.
+	$name =~ s|\\|\\5c|g;
+	$name =~ s| |\\20|g;
 
 	my $typestart = rindex($_, " ", $namestart-1);
 	# -1 removes the ? at the end
 	my $type = substr($_, $typestart+1, $namestart-$typestart-1);
 	my @parts = split(/ /, $_, 7);
 
+	if (substr($parts[6], 0, 7) eq "Flags [") {
+	    $protocol = "tcp";
+#	    print $_;
+	}
+	if ($rawskip) {
+	    # OK, so, we didn't find a name server query.  If this
+	    # query is TCP with a length of 0, , we can silently drop
+	    # the NOMATCH, because it is a fragment.
+	    if ($protocol eq "tcp") {
+		if (substr($_, -7) eq "length 0") {
+		    # TCP fragment.  Skip silently
+		    next;
+		}
+	    }
+	}
+
 	my $date = $parts[0];
 	my $time = $parts[1];
-        my $sip  = $parts[3];
+
+	# Handle GREv0: use the second set of sip/dip
+	my ($sip, $dip);
+	if ($parts[6] eq "GREv0") {
+	    $sip = $parts[10];
+	    $dip = $parts[12];
+	}
+	else {
+	    $sip = $parts[3];
+	    $dip = $parts[5];
+	}
+
         my $sipe = rindex($sip, ".");
+	my $sport = substr($sip, $sipe + 1);
         substr($sip, $sipe) = "";
-        my $dip   = $parts[5];
         my $dipe = rindex($dip, ".");
+	my $dport = substr($dip, $dipe + 1);
+	chop($dport);  # has an extra : on the end
         substr($dip, $dipe) = "";
 	my $root = $ROOTBYIP{$dip};
+	if ($dport != 53) {
+	    # The destination port isn't 53.
+#	    print "RAWSKIP: DPORTNOT53: $filenum: $_";
+	    next;
+	}
 	if (!defined $root) {
 	    # The destination IP address doesn't match any known root
 	    # address, so we're going to ignore this row.
-	    print "non-root: $src $_";
+	    print "RAWSKIP: NONROOT: $filenum: $_";
 	    next;
 	}
+	if ($rawskip) {
+	    print "RAWSKIP: NOMATCH: $filenum: $_";
+	    next;
+	}
+
+	# Split the name into parts based on .  Pop off the final .
+	# Pop off the next to get the SLD.  Use "." for the SLD if
+	# there wasn't one.
         my @dom_parts = split(/\./, $name);
         pop @dom_parts;
         my $sld = pop @dom_parts || ".";
-
-	print $outlog join " ", $date, $time, $sip, $dip, $root, $type, $name, "\n";
-	my $file = $tld;
-	if (!defined $files{$file}) {
-            #$files{$file} = new IO::Compress::Gzip "$outdir/$file" || die "gzip failed: $GzipError";
-            open(my $fh, ">>", "$bytld_dst/$file") || die "ERROR: failed to open for $tld: $!";
-            $files{$file} = $fh;
-        }
-        my $fh = $files{$file};
-        syswrite $fh, "$date $time $tld $sld $root $sip $dip $name\n";
+	
+	my @outdata = ($date, $time, $tld, $sld, $filenum, $protocol,
+		       "$sip.$sport", "$dip.$dport", $root, $type);
+	if ((index($name, '^') != -1) || (index($name, 'm-') != -1)) {
+	    # String has binary data.  Go into raw mode;
+	    $parseRawName = 1;
+	    @rawline = @outdata;
+	    push(@rawline, $tld, $name);
+	    undef (@rawdata);
+#	    print "Going raw: $name\n";
+#	    print $_;
+	}
+	else {
+	    push(@outdata, $namelen, $name);
+	    print $outlog (join " ", @outdata)."\n";
+	    
+	    my $file = $tld;
+	    if (!defined $files{$file}) {
+		#$files{$file} = new IO::Compress::Gzip "$outdir/$file" || die "gzip failed: $GzipError";
+		open(my $fh, ">>", "$bytld_dst/$file") || die "ERROR: failed to open for $tld: $!";
+		$files{$file} = $fh;
+	    }
+	    my $fh = $files{$file};
+	    syswrite $fh, (join " ", @outdata)."\n";
+	}
     }
     close($outlog);
     close(IN);
@@ -722,9 +1095,18 @@ sub CompressByTld {
 
 sub Usage {
     print "subtld.pl --year YEAR --suffix SUFFIX [--raw] [--jas] [--single tldname]\n";
+    print "          [--jassuffix SUFFIX]\n";
+    print "          [--ldh | --noldh] [--len | --nolen]\n";
+    print "          [--random | --norandom] [--hyphen | --nohyphen]\n";
+    print "          [--punycode | --nopunycode]\n\n";
+    print "          --jassuffix: suffix used for destination in JAS pass\n";
     print "          --raw: do processing of RAW data\n";
     print "          --jas: do processing of JAS summarization\n";
     print "          (Without --raw or --jas, nothing will be done.)\n";
+    print "          --ldh: do checks for LDH at SLD\n";
+    print "          --len: do length checks: entire string, SHORTSLD\n";
+    print "          --random: do checks for random at left-most label\n";
+    print "          --hyphen: do checks for trailing/leading hyphens at all levels\n";
 }
 
 ############################################################################### 
@@ -740,13 +1122,19 @@ sub main {
     my $doRaw;
     my $doJAS;
 
-    my ($year, $suffix);
+    my ($year, $suffix, $jassuffix);
 
     GetOptions("single=s" => \$single,
 	       'suffix=s' => \$suffix,
+	       'jassuffix=s' => \$jassuffix,
 	       'year=i' => \$year,
 	       'raw' => \$doRaw,
 	       'jas' => \$doJAS,
+	       'ldh!' => \$DO_LDH_CHECKS,
+	       'len!' => \$DO_LEN_CHECKS,
+	       'punycode!' => \$DO_PUNYCODE_CHECKS,
+	       'random!' => \$DO_RANDOM_CHECKS,
+	       'hyphen!' => \$DO_HYPHEN_CHECKS,
 	);
     if (!defined $year) {
 	Usage();
@@ -760,13 +1148,16 @@ sub main {
 	Usage();
 	exit(1);
     }
-    my ($raw, $intermediate, $bytld, $jas) = CalcSrcDst($year, $suffix);
+    my ($raw, $intermediate, $bytld, $jas) = CalcSrcDst($year, $suffix, $jassuffix, 0);
 
     if ($doRaw)
     {
-	VerifySrc($raw);
+	if (VerifySrc($raw) != 0) {
+	    exit(2);
+	}
 	VerifyDst($intermediate, $bytld);
 	my $rawFiles = FindRawFiles($year, $ROOTMAP{$year}, $raw);
+	DumpRawMap($rawFiles, $intermediate, $bytld);
 	ParseRawFiles($rawFiles, $intermediate, $bytld);
 	SortByTld($bytld);
 	CompressByTld($bytld);
@@ -774,37 +1165,59 @@ sub main {
 	
     if ($doJAS)
     {
-	VerifySrc($bytld);
-	VerifyDst($jas);
+	if ($year ne "all") {
+	    if (VerifySrc($bytld) != 0 ) {
+		($raw, $intermediate, $bytld, $jas) = CalcSrcDst($year, $suffix, $jassuffix, 1);
+		if (VerifySrc($bytld) != 0) {
+		    exit(2);
+		}
+	    }
+	    VerifyDst($jas);
+	}
+
+	print "Do full label hyphen checks\n" if ($DO_HYPHEN_CHECKS);
+	print "Do SLD LDH character checks\n" if ($DO_LDH_CHECKS);
+	print "Do length checks (full name, SHORTSLD)\n" if ($DO_LEN_CHECKS);
+	print "Do RANDOM checks\n" if ($DO_RANDOM_CHECKS);
+	print "Do valid Punycode checks\n" if ($DO_PUNYCODE_CHECKS);
+
+	my @files2;
 	if (defined $single) { 
 	    my $file = $single;
 	    if ($file =~ /^(.*).gz$/) {
-		my $gtld = $1;
-		CopyAndSub($bytld."/".$file,
-			   $jas,
-			   $gtld,
-			   $year);
-	    } 
+		my %procfile;
+		$procfile{filename} = $file;
+		$procfile{src} = $bytld;
+		$procfile{dst} = $jas;
+		$procfile{year} = $year;
+		
+		push(@files2, \%procfile);
+	    }
 	}
 	else {
 	    opendir(DIR, $bytld);
 	    my @files = readdir(DIR);
 	    closedir(DIR); 
-	    my @files2;
 	    foreach my $file (@files) {
 		if ($file =~ /^(.*).gz$/) {
-		    push(@files2, $file);
+		    my %procfile;
+		    $procfile{filename} = $file;
+		    $procfile{src} = $bytld;
+		    $procfile{dst} = $jas;
+		    $procfile{year} = $year;
+			
+		    push(@files2, \%procfile);
 		}
 	    }
-	    runCopyAndSub(\@files2, $bytld, $jas, $year);
 	}
+	runCopyAndSub(\@files2);
     }
 }
  
 ############################################################################### 
 
 sub runCopyAndSub {
-    my ($files, $src, $dst, $year) = @_;
+    my ($files) = @_;
     my $sleeptime = 0;
     my $qlen = scalar(@$files);
 
@@ -826,7 +1239,11 @@ sub runCopyAndSub {
 	    }
 	    sleep(5); 
 	}
-	my $file = shift(@$files);
+	my $procfile = shift(@$files);
+	my $file = $procfile->{filename};
+	my $src = $procfile->{src};
+	my $dst = $procfile->{dst};
+	my $year = $procfile->{year};
 	$file =~ /^(.*).gz$/;
 	my $gtld = $1;
 	print "Parent ($$) starting child for $qlen $file\n";
@@ -868,6 +1285,7 @@ sub populateOverrides
 	'boockstore' => 1,
 	'fruitsmoke' => 1,
 	'musclefood' => 1,
+	'changelogs' => 1,
 	);
     %OVERRIDE13 = (
 	'p12-rout01-pr.3975' => 1,
