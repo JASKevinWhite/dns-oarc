@@ -52,6 +52,7 @@ use POSIX ":sys_wait_h";
 use File::Path qw(make_path);
 use File::Find;       # will use to replace system call to find
 use Net::IDN::Encode ':all';
+use Time::Local;
 #use NetPacket::IP;
 #use NetPacket::TCP;
 #use NetPacket::UDP;
@@ -59,7 +60,7 @@ use Net::IDN::Encode ':all';
 
 $SIG{CHLD} = \&REAPER;
 
-our $VERSION = '$Id: subtld.pl 94 2013-11-04 18:19:46Z kwhite $';
+our $VERSION = '$Id: subtld.pl 100 2013-11-26 20:36:11Z kwhite $';
 
 #use PerlIO::gzip;
 #use threads;
@@ -69,6 +70,11 @@ our $VERSION = '$Id: subtld.pl 94 2013-11-04 18:19:46Z kwhite $';
 # the definitions in here as a note, in case their use needs to be
 # resurrected.  Use case: one user wishes to use processed data in
 # another user's directory.
+
+# For 2010, the first row is the official DITL data.  There are other
+# datasets available in that year, because lots of DITL captures were
+# run, due to the roots being signed.  If you wish to include any of
+# the other sets, uncomment the lines.
 
 my %LOC = (
     2013 => { 'date' => 'DITL-20130528',
@@ -81,7 +87,18 @@ my %LOC = (
 	      'raw' => '/mnt/oarc-pool4/DITL-20110412/RAW',
 	      'bytld' => '/home/kwhite/gtld/by-tld'},
     2010 => { 'date' => 'DITL-20100413',
-	      'raw' => '/mnt/oarc-pool4/DITL-20100413/RAW',
+#	      'date' => 'DITL-2010',
+	      'raw' => ['/mnt/oarc-pool4/DITL-20100413/RAW',
+#			'/mnt/oarc-pool3/DITL-20100112/CLEAN',
+#			'/mnt/oarc-pool3/DITL-20100119/CLEAN',
+#			'/mnt/oarc-pool3/DITL-20100126/CLEAN',
+#			'/mnt/oarc-pool3/DITL-20100323/CLEAN',
+#			'/mnt/oarc-pool3/DITL-20100504/RAW',
+#			'/mnt/oarc-pool3/DITL-20100525/RAW',
+#			'/mnt/oarc-pool3/DITL-20100714/CLEAN',
+#			'/mnt/oarc-pool4/DITL-20100209/RAW',
+#			'/mnt/oarc-pool4/DITL-20100302/RAW',
+		  ],
 	      'bytld' => '/home/kwhite/gtld/by-tld'},
     2009 => { 'date' => 'DITL-200903',
 #	      'raw' => '/mnt/oarc-pool4/DITL-200903/RAW',
@@ -126,6 +143,8 @@ my $DO_LEN_CHECKS = 0;
 my $DO_RANDOM_CHECKS = 0;
 my $DO_PUNYCODE_CHECKS = 1;
 
+my $DO_RAW_DECODE = 1;
+
 ############################################################################### 
 
 main();
@@ -140,6 +159,80 @@ sub REAPER {
 	push(@STIFFS, $stiff);
     }
     $SIG{CHLD} = \&REAPER;                  # install *after* calling waitpid
+}
+
+###############################################################################
+
+sub CalcTS {
+    my ($date, $time) = @_;
+
+    my $ts;
+
+#2011-04-12 20:54:06.876091
+
+    $date =~ /^(\d{4})-(\d{2})-(\d{2})$/;
+    my $year = $1 - 1900;
+    my $mon = $2 - 1;
+    my $mday = $3;
+    $time =~ /^(\d{2}):(\d{2}):(\d{2}).(\d*)$/;
+    my $hour = $1;
+    my $min = $2;
+    my $sec = $3;
+    my $msec = $4;
+
+    $ts = timegm( $sec, $min, $hour, $mday, $mon, $year );
+
+#    print "$date|$time -> $ts\n";
+
+    return($ts);
+}
+
+###############################################################################
+
+sub GroupRandoms {
+    my ($randoms) = @_;
+
+    my ($countall, $countyes);
+    $countall = $countyes = 0;
+
+#    print "Before:\n";
+#    print Dumper($randoms);
+
+    foreach my $sip (keys(%$randoms)) {
+	my ($i1, $i2, $i3);
+        foreach my $dt (sort(keys(%{$randoms->{$sip}}))) {
+	    foreach my $elem (@{$randoms->{$sip}{$dt}}) {
+		$countall++;
+		my $elemdt = { };
+		$elemdt->{dt} = $dt;
+		$elemdt->{elem} = $elem;
+
+		$elem->[11] = "OK";
+
+		$i1 = $i2;
+		$i2 = $i3;
+		$i3 = $elemdt;
+		if ((defined $i1) && (defined $i1->{dt}) &&
+		    ($i1->{dt} >= $dt - 30))
+		{
+		    # We're looking at element 3.  There is an
+		    # element 1 who's time is within 30 seconds behind
+		    # ours.  Thus, all 3 are in a group.  Mark all 3
+		    # as random, and clear them out.
+		    $i1->{elem}->[11] = "RANDOM10";
+		    $i2->{elem}->[11] = "RANDOM10";
+		    $i3->{elem}->[11] = "RANDOM10";
+		    $i1 = undef;
+		    $i2 = undef;
+		    $i3 = undef;
+		    $countyes += 3;
+		}
+	    }
+	}
+    }
+#    print "After: $countyes random out of $countall\n";
+#    print Dumper($randoms);
+    return($countyes, $countall);
 }
 
 ###############################################################################
@@ -161,6 +254,8 @@ sub CopyAndSub {
     if (($year == 2013) && ($gtld eq "home")) { $use_db = 1};
     if (($gtld eq "home") || ($gtld eq "corp")) { return();};
 
+    my $randoms = { };
+
     # Attempt to use an on-disk database instead of RAM. About 3
     # orders of magnitude too slow.  Would need to write something
     # much more optimized, and still probably not enough.
@@ -174,15 +269,53 @@ sub CopyAndSub {
     open(IN, "gunzip -c $src |") || die "ERROR; failed to open input file $src: $!";
     open(my $out, "| gzip -c > $dst") || die "ERROR: failed to open output file $dst: $!";
     while(<IN>) {
-	my ($scrub, $interisle, $retrow, $qstr, $sld) = 
+	my ($scrub, $interisle, $retrow, $qstr, $sld, $elem) = 
 	    ScrubAndInterisle($_);
 	if (!defined $scrub) { next; }
-	addToDrop($droplist, $scrub, $qstr, $sld);
-	$intsum{$interisle}++;
-	print $out $retrow."\n";
+	if ($scrub eq "RANDOM10") {
+	    my $date = $elem->[0];
+	    my $time = $elem->[1];
+	    my $sip = $elem->[6];
+#	    my $scrub = $elem->[11];
+#	    my $qstr = $elem->[13];
+#	    my $sld = $elem->[3];
+
+	    # Remove final .sourceport
+#	    print "sip: $sip -> ";
+	    substr($sip, rindex($sip, ".")) = "";
+#	    print "$sip\n";
+
+#2011-04-12 20:54:06.876091
+	    my $dt = CalcTS($date, $time);
+
+	    push(@{$randoms->{$sip}{$dt}}, $elem);
+	}
+	else {
+	    addToDrop($droplist, $scrub, $qstr, $sld);
+	    $intsum{$interisle}++;
+	    print $out $retrow."\n";
+	}
     }
     close(IN);
+
+    my ($randyes, $randtot) = GroupRandoms($randoms);
+    foreach my $sip (keys(%$randoms)) {
+	foreach my $dt(sort(keys(%{$randoms->{$sip}}))) {
+	    foreach my $elem (@{$randoms->{$sip}{$dt}}) {
+		my $scrub = $elem->[11];
+		my $interisle = $elem->[12];
+		my $qstr = $elem->[13];
+		my $sld = $elem->[3];
+		my $retrow = join(" ", @$elem);
+		addToDrop($droplist, $scrub, $qstr, $sld);
+		$intsum{$interisle}++;
+		print $out $retrow."\n";
+	    }
+	}
+    }
+
     close($out);
+    print "$gtld: random: $randyes out of $randtot\n";
 
     # Create two summary files.  $dst_log_nocollapse just has one row
     # per qstr, with a count, sorted by sld.  $dst_log is more
@@ -326,7 +459,7 @@ sub ScrubAndInterisle
 	    $scrubbed++;
 	}
 	else {
-	    print "VALIDPUNYCODE: $sld -> $unic\n";
+#	    print "VALIDPUNYCODE: $sld -> $unic\n";
 	}
     }
 
@@ -414,7 +547,7 @@ sub ScrubAndInterisle
     $elem[13] = $qstr;
     my $retrow = join(" ", @elem);
 
-    return($scrub, $interisle, $retrow, $qstr, $sld);
+    return($scrub, $interisle, $retrow, $qstr, $sld, \@elem);
 }
 
 ###############################################################################
@@ -440,7 +573,15 @@ sub addToDrop {
 ############################################################################### 
 
 sub VerifySrc {
-    my (@src) = @_;
+    my ($src) = @_;
+
+    my @src;
+    if (ref($src) eq "ARRAY") {
+	@src = @$src;
+    }
+    else {
+	@src[0] = $src;
+    }
 
     # A source should exist and be a directory
 
@@ -499,7 +640,7 @@ sub CalcSrcDst {
     my ($raw, $intermediate, $bytld, $jas);
 
     $raw = $LOC{$year}{raw};
-
+    
     my $mydstbase = ($systemwide_archive) ? $DNS_OARCBASE : $DSTBASE;
 
     $intermediate = $mydstbase."/intermediate/".$LOC{$year}{date}."-".$suffix;
@@ -513,31 +654,52 @@ sub CalcSrcDst {
 ############################################################################### 
 
 sub FindRawFiles {
-    my ($year, $map, $src) = @_;
+    my ($year, $map, $src_in) = @_;
+
+    my @src;
+    if (ref($src_in) eq "ARRAY") {
+        @src = @$src_in;
+    }
+    else {
+        @src[0] = $src_in;
+    }
     
     my $rawFiles = [ ];
 
 #    print Dumper($map);
     foreach my $root (sort(keys(%$map)))
     {
-	my $cmd = "find \"$src/$map->{$root}{loc}\" -type f";
-	print "$cmd\n";
-	my @output = qx/$cmd/;
-	foreach my $line (@output) {
-	    chomp $line;
-	    my %file;
-	    $file{root} = $root;
-	    $file{src} = $line;
-
-	    # Calculate a destination name for the intermediate file.
-	    # Start past the root, and replace all / by _ to flatten
-	    # out the filename/directory structure
-	    
-	    my $dst = substr($line, index($line, $root) + length($root) + 1);
-	    $dst =~ s/\//_/g;
-	    $file{dst} = $dst;
-	    push(@$rawFiles, \%file);
-#	    print Dumper(\%file);
+	foreach my $src (@src)
+	{
+	    my $locref = $map->{$root}{loc};
+	    my @loc;
+	    if (ref($locref) eq "ARRAY") {
+		@loc = @$locref;
+	    }
+	    else {
+		@loc[0] = $locref;
+	    }
+	    foreach my $loc (@loc) {
+		my $cmd = "find \"$src/$loc\" -type f";
+		print "$cmd\n";
+		my @output = qx/$cmd/;
+		foreach my $line (@output) {
+		    chomp $line;
+		    my %file;
+		    $file{root} = $root;
+		    $file{src} = $line;
+		    
+		    # Calculate a destination name for the intermediate file.
+		    # Start past the root, and replace all / by _ to flatten
+		    # out the filename/directory structure
+		    
+		    my $dst = substr($line, index($line, $root) + length($root) + 1);
+		    $dst =~ s/\//_/g;
+		    $file{dst} = $dst;
+		    push(@$rawFiles, \%file);
+#		    print Dumper(\%file);
+		}
+	    }
 	}
     }
     return($rawFiles);
@@ -813,14 +975,29 @@ sub DumpPcap {
     open(my $outlog, "| gzip -c > $dst") || die "ERROR failed to open output file $dst: $!";
 #    print "gunzip -dc \"$src\" | tcpdump -tttt -X -n -s 0 -r -\n";
     
-    open(IN, "gunzip -c $src|" ); 
+    my $gzip = ($src =~ /\.gz$/);
+    
+    my $IN;
+    if ($gzip) {
+	open($IN, "gunzip -c $src|") || die "ERROR failed to open input file and tcpdump $src: $!";
+    }
+    else {
+	open($IN, $src) || die "ERROR failed to open input file and tcpdump $src: $!";
+    }
+
     my $hdr;
-    sysread(IN, $hdr, 24); 
+    sysread($IN, $hdr, 24); 
     my ($magic, $maj, $min, $off, $acc, $snaplen, $linktype) = unpack("LSSLLLL", $hdr); 
 #    print "linktype: $linktype\n";
-    close(IN);
+    close($IN);
 
-    open(IN, "gunzip -dc \"$src\" | tcpdump -tttt -XX -n -s 0 -r - 2> /dev/null |") || die "ERROR failed to open input file and tcpdump $src: $!";
+    my $raw_option = ($DO_RAW_DECODE) ? "-XX" : "";
+    if ($gzip) {
+	open($IN, "gunzip -dc \"$src\" | tcpdump -tttt $raw_option -n -s 0 -r - 2> /dev/null |") || die "ERROR failed to open input file and tcpdump $src: $!";
+    }
+    else {
+	open($IN, "/usr/sbin/tcpdump -tttt $raw_option -n -s 0 -r \"$src\" 2> /dev/null |") || die "ERROR failed to open input file and tcpdump $src: $!";
+    }
     my %files;
 
 #    gunzip -dc "$infile" | tcpdump -n -s 0 -r - 2> /dev/null | ./filter-tcpdump-tldlist.pl $tldlist | gzip -6 > $outname.gz
@@ -831,7 +1008,7 @@ sub DumpPcap {
     my @rawline;
     my @rawdata;
 
-    while (<IN>) {
+    while (<$IN>) {
 #	print "$_";
 	
 	if (substr($_, 0, 3) eq "\t0x") {
@@ -988,7 +1165,7 @@ sub DumpPcap {
 	
 	my @outdata = ($date, $time, $tld, $sld, $filenum, $protocol,
 		       "$sip.$sport", "$dip.$dport", $root, $type);
-	if ((index($name, '^') != -1) || (index($name, 'm-') != -1)) {
+	if (($DO_RAW_DECODE) && ((index($name, '^') != -1) || (index($name, 'm-') != -1))) {
 	    # String has binary data.  Go into raw mode;
 	    $parseRawName = 1;
 	    @rawline = @outdata;
@@ -1012,7 +1189,7 @@ sub DumpPcap {
 	}
     }
     close($outlog);
-    close(IN);
+    close($IN);
     %files = (); # close everything
 }
 
@@ -1149,7 +1326,7 @@ sub main {
 	exit(1);
     }
     my ($raw, $intermediate, $bytld, $jas) = CalcSrcDst($year, $suffix, $jassuffix, 0);
-
+    
     if ($doRaw)
     {
 	if (VerifySrc($raw) != 0) {
@@ -1165,9 +1342,11 @@ sub main {
 	
     if ($doJAS)
     {
+	print "Trying $bytld for source\n";
 	if ($year ne "all") {
 	    if (VerifySrc($bytld) != 0 ) {
 		($raw, $intermediate, $bytld, $jas) = CalcSrcDst($year, $suffix, $jassuffix, 1);
+		print "Trying $bytld for source\n";
 		if (VerifySrc($bytld) != 0) {
 		    exit(2);
 		}
@@ -1888,7 +2067,7 @@ sub populateRootMap
 		'loc' => 'l-root',
 	    },
 	    'm-root' => {
-		'loc' => 'm-root',
+		'loc' => [ 'm-root', 'wide' ],
 	    },
 	},
 	2009 => {
